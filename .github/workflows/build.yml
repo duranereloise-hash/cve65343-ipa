@@ -7,13 +7,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build with xcodebuild (unsigned)
         run: |
+          set -o pipefail
           xcodebuild -project Test.xcodeproj -scheme Test -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tail -20
+            build 2>&1 | tee build.log | tail -40
+          RC=${PIPESTATUS[0]}
+          if [ $RC -ne 0 ]; then
+            echo "===== BUILD FAILED ====="
+            grep -E "error" build.log | head -40
+            exit 1
+          fi
           APP=$(find ~/Library/Developer/Xcode/DerivedData -name "Test.app" -path "*/Release-iphoneos/*" | head -1)
           echo "APP=$APP"
-          if [ -z "$APP" ]; then echo "no .app"; exit 1; fi
+          if [ -z "$APP" ]; then echo "no .app dir"; exit 1; fi
+          test -f "$APP/Test" || { echo "NO BINARY in .app"; ls -la "$APP"; exit 1; }
           mkdir -p Payload
           cp -r "$APP" Payload/
           rm -rf Payload/Test.app/_CodeSignature 2>/dev/null || true

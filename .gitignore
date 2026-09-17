@@ -1,0 +1,6 @@
+ipa_out/
+ipa_out2/
+repack_work/
+tmp/
+runlog.txt
+*.log
