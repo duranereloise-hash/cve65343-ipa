@@ -170,6 +170,8 @@ static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int 
     return slide;
 }
 
+@implementation ViewController
+
 - (void)runProbe {
     logline(@"=== AKS OOB probe ===");
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleKeyStore"));
